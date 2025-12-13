@@ -1,6 +1,7 @@
-import os, re, tempfile, shutil, uuid, time, hmac, hashlib, json, secrets, subprocess
+﻿# -*- coding: utf-8 -*-
+import os, re, tempfile, shutil, uuid, time, hmac, hashlib, json, secrets, subprocess, threading
 from datetime import datetime
-from flask import Flask, request, send_file, render_template_string, abort, url_for, redirect
+from flask import Flask, request, send_file, render_template_string, abort, url_for, redirect, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 import yt_dlp, imageio_ffmpeg
@@ -19,7 +20,7 @@ app = Flask(__name__)
 if not os.environ.get("APP_SECRET"):
     if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("FLASK_ENV") == "production":
         raise RuntimeError("APP_SECRET environment variable is required in production")
-    print("⚠️  WARNING: Using random APP_SECRET (development only)")
+    print("âš ï¸  WARNING: Using random APP_SECRET (development only)")
 
 SECRET = (os.environ.get("APP_SECRET") or secrets.token_hex(16)).encode()
 
@@ -28,6 +29,10 @@ os.makedirs(TMP_BASE, exist_ok=True)
 SESSION_TTL = 30 * 60  # 30 min
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB
 app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_SIZE
+
+# Sistema de progreso para SSE
+progress_store = {}  # {session_id: {"progress": 0-100, "message": str, "status": str, "error": str}}
+progress_lock = threading.Lock()
 
 # ---------- HTMLs ----------
 HOME_HTML = r'''<!doctype html>
@@ -64,11 +69,30 @@ YOUTUBE_HTML = r'''<!doctype html>
   body { font-family: system-ui, Arial, sans-serif; max-width: 680px; margin: 2rem auto; padding: 1rem; line-height: 1.5; }
   .group { margin-bottom: 1rem; }
   label { display: block; font-weight: 600; margin-bottom: .25rem; }
-  input[type=url] { width: 100%; padding: .65rem; font-size: 1rem; }
+  input[type=url] { width: 100%; padding: 100%; padding: .65rem; font-size: 1rem; }
   button { padding: .65rem 1rem; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
   .hint { font-size: .95rem; }
-  .status { margin-top: 1rem; }
   .sr-only { position: absolute; left: -10000px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+  .progress-container { display: none; margin-top: 1.5rem; padding: 1rem; background: #f5f5f5; border-radius: 8px; }
+  .progress-container.active { display: block; }
+  .progress-label { display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-weight: 600; }
+  .progress-percentage { color: #0066cc; font-size: 1.1rem; }
+  .progress-bar { width: 100%; height: 24px; background: #e0e0e0; border-radius: 12px; overflow: hidden; box-shadow: inset 0 1px 3px rgba(0,0,0,0.2); }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, #0066cc, #0088ff); border-radius: 12px; transition: width 0.3s ease; position: relative; }
+  .progress-fill::after { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent); animation: shimmer 2s infinite; }
+  @keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+  .progress-message { margin-top: 0.5rem; font-size: 0.9rem; color: #666; font-style: italic; }
+  .progress-bar.complete .progress-fill { background: linear-gradient(90deg, #4caf50, #66bb6a); }
+  .progress-bar.error .progress-fill { background: linear-gradient(90deg, #f44336, #e57373); }
+  @media (prefers-color-scheme: dark) {
+    .progress-container { background: #2a2a2a; }
+    .progress-bar { background: #1a1a1a; }
+    .progress-message { color: #b0b0b0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .progress-fill, .progress-fill::after { animation: none; transition: none; }
+  }
 </style>
 </head>
 <body>
@@ -76,30 +100,116 @@ YOUTUBE_HTML = r'''<!doctype html>
   <h1>Usar enlace de YouTube</h1>
   <p><a href="{{ url_for('index') }}">Volver</a></p>
 </header>
-
 <main role="main" aria-labelledby="h2">
   <h2 id="h2" class="sr-only">Formulario de conversión</h2>
-
-  <form action="{{ url_for('prepare') }}" method="post" aria-describedby="instrucciones">
-    <div id="instrucciones" class="hint">
-      Pega un enlace de YouTube y pulsa “Preparar audio”.
-    </div>
-
+  <form id="prepareForm" aria-describedby="instrucciones">
+    <div id="instrucciones" class="hint">Pega un enlace de YouTube y pulsa "Preparar audio".</div>
     <div class="group">
       <label for="url">Enlace de YouTube</label>
       <input id="url" name="url" type="url" inputmode="url" required>
     </div>
-
-    <button type="submit">Preparar audio</button>
-    <div id="status" class="status" aria-live="polite"></div>
+    <button type="submit" id="submitBtn">Preparar audio</button>
   </form>
+  <div id="progressContainer" class="progress-container" role="region" aria-label="Progreso de procesamiento">
+    <div aria-live="polite" aria-atomic="true" class="sr-only" id="announcer"></div>
+    <div class="progress-label">
+      <span id="progressStatus">Preparando</span>
+      <span class="progress-percentage" id="progressPercent" aria-live="polite">0%</span>
+    </div>
+    <div id="progressBar" class="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" aria-labelledby="progressStatus">
+      <div class="progress-fill" id="progressFill" style="width: 0%">
+        <span class="sr-only" id="progressSR">0% completado</span>
+      </div>
+    </div>
+    <div class="progress-message" id="progressMessage" aria-live="polite"></div>
+  </div>
 </main>
 <script>
-  const form = document.querySelector('form');
-  const status = document.getElementById('status');
-  form.addEventListener('submit', () => {
-    if (status) status.textContent = 'Procesando… si el vídeo es largo, puede tardar.';
+(function() {
+  const form = document.getElementById('prepareForm');
+  const submitBtn = document.getElementById('submitBtn');
+  const progressContainer = document.getElementById('progressContainer');
+  const progressBar = document.getElementById('progressBar');
+  const progressFill = document.getElementById('progressFill');
+  const progressPercent = document.getElementById('progressPercent');
+  const progressMessage = document.getElementById('progressMessage');
+  const progressStatus = document.getElementById('progressStatus');
+  const progressSR = document.getElementById('progressSR');
+  const announcer = document.getElementById('announcer');
+  let lastAnnouncedProgress = -1;
+  let eventSource = null;
+  form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    const url = document.getElementById('url').value.trim();
+    if (!url) return;
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Procesando...';
+    progressContainer.classList.add('active');
+    updateProgress(0, 'Iniciando procesamiento...', 'preparing');
+    fetch('{{ url_for("prepare") }}', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'url=' + encodeURIComponent(url)
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { showError(data.error); return; }
+      const sid = data.session_id;
+      eventSource = new EventSource('{{ url_for("progress_stream", sid="") }}' + sid);
+      eventSource.addEventListener('progress', function(e) {
+        const data = JSON.parse(e.data);
+        updateProgress(data.progress, data.message, data.status);
+      });
+      eventSource.addEventListener('complete', function(e) {
+        const data = JSON.parse(e.data);
+        eventSource.close();
+        window.location.href = data.editor_url;
+      });
+      eventSource.addEventListener('error_event', function(e) {
+        const data = JSON.parse(e.data);
+        eventSource.close();
+        showError(data.error);
+      });
+      eventSource.onerror = function() {
+        eventSource.close();
+        showError('Error de conexión. Por favor, intenta de nuevo.');
+      };
+    })
+    .catch(err => { showError('Error: ' + err.message); });
   });
+  function updateProgress(progress, message, status) {
+    progress = Math.min(Math.max(progress, 0), 100);
+    progressFill.style.width = progress + '%';
+    progressPercent.textContent = Math.round(progress) + '%';
+    progressMessage.textContent = message;
+    progressBar.setAttribute('aria-valuenow', progress);
+    progressSR.textContent = Math.round(progress) + '% completado';
+    if (status === 'complete') {
+      progressBar.classList.add('complete');
+      progressStatus.textContent = 'Completado';
+    } else if (status === 'error') {
+      progressBar.classList.add('error');
+      progressStatus.textContent = 'Error';
+    } else {
+      progressStatus.textContent = 'Procesando';
+    }
+    const roundedProgress = Math.floor(progress / 25) * 25;
+    if (roundedProgress !== lastAnnouncedProgress && roundedProgress > 0) {
+      lastAnnouncedProgress = roundedProgress;
+      announcer.textContent = 'Progreso: ' + roundedProgress + '%';
+    }
+  }
+  function showError(error) {
+    updateProgress(0, error, 'error');
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Preparar audio';
+    announcer.textContent = 'Error: ' + error;
+    setTimeout(() => {
+      progressContainer.classList.remove('active');
+      progressBar.classList.remove('error');
+    }, 5000);
+  }
+})();
 </script>
 </body>
 </html>'''
@@ -146,7 +256,7 @@ EDITOR_HTML = r'''<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>Editar recorte – {{ title }}</title>
+<title>Editar recorte â€“ {{ title }}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { color-scheme: light dark; }
@@ -178,10 +288,10 @@ EDITOR_HTML = r'''<!doctype html>
   <section class="block" aria-labelledby="navh">
     <h2 id="navh" class="sr-only">Navegación temporal</h2>
     <div class="row">
-      <button type="button" data-step="-30">−30 s</button>
-      <button type="button" data-step="-5">−5 s</button>
-      <button type="button" data-step="-1">−1 s</button>
-      <button type="button" data-step="-0.1">−0.1 s</button>
+      <button type="button" data-step="-30">âˆ’30 s</button>
+      <button type="button" data-step="-5">âˆ’5 s</button>
+      <button type="button" data-step="-1">âˆ’1 s</button>
+      <button type="button" data-step="-0.1">âˆ’0.1 s</button>
       <button type="button" data-step="0.1">+0.1 s</button>
       <button type="button" data-step="1">+1 s</button>
       <button type="button" data-step="5">+5 s</button>
@@ -416,7 +526,7 @@ EDITOR_HTML = r'''<!doctype html>
     player.currentTime = st;
     nextPlayIsPreview = true; // marca que el próximo play es de previsualización
     const p = player.play(); if (p && p.catch) p.catch(()=>{});
-    live.textContent = `Reproduciendo recorte ${startI.value} → ${endI.value}.`;
+    live.textContent = `Reproduciendo recorte ${startI.value} â†’ ${endI.value}.`;
   });
 
   window.addEventListener('load', ()=>{
@@ -426,6 +536,98 @@ EDITOR_HTML = r'''<!doctype html>
 </script>
 </body>
 </html>'''
+
+# ---------- Sistema de progreso ----------
+def update_progress(sid: str, progress: int, message: str, status: str = "processing"):
+    """Actualiza el progreso de una sesión"""
+    with progress_lock:
+        if sid not in progress_store:
+            progress_store[sid] = {}
+        progress_store[sid].update({
+            "progress": progress,
+            "message": message,
+            "status": status,
+            "timestamp": time.time()
+        })
+
+def set_progress_error(sid: str, error: str):
+    """Marca una sesión con error"""
+    with progress_lock:
+        if sid not in progress_store:
+            progress_store[sid] = {}
+        progress_store[sid].update({
+            "status": "error",
+            "error": error,
+            "timestamp": time.time()
+        })
+
+def set_progress_complete(sid: str, message: str = "Completado"):
+    """Marca una sesión como completada"""
+    with progress_lock:
+        if sid not in progress_store:
+            progress_store[sid] = {}
+        progress_store[sid].update({
+            "progress": 100,
+            "message": message,
+            "status": "complete",
+            "timestamp": time.time()
+        })
+
+def get_progress(sid: str):
+    """Obtiene el progreso actual de una sesión"""
+    with progress_lock:
+        return progress_store.get(sid, {}).copy()
+
+def cleanup_progress(sid: str):
+    """Limpia el progreso de una sesión"""
+    with progress_lock:
+        progress_store.pop(sid, None)
+
+# ---------- Sistema de progreso ----------
+def update_progress(sid: str, progress: int, message: str, status: str = "processing"):
+    """Actualiza el progreso de una sesión"""
+    with progress_lock:
+        if sid not in progress_store:
+            progress_store[sid] = {}
+        progress_store[sid].update({
+            "progress": progress,
+            "message": message,
+            "status": status,
+            "timestamp": time.time()
+        })
+
+def set_progress_error(sid: str, error: str):
+    """Marca una sesión con error"""
+    with progress_lock:
+        if sid not in progress_store:
+            progress_store[sid] = {}
+        progress_store[sid].update({
+            "status": "error",
+            "error": error,
+            "timestamp": time.time()
+        })
+
+def set_progress_complete(sid: str, message: str = "Completado"):
+    """Marca una sesión como completada"""
+    with progress_lock:
+        if sid not in progress_store:
+            progress_store[sid] = {}
+        progress_store[sid].update({
+            "progress": 100,
+            "message": message,
+            "status": "complete",
+            "timestamp": time.time()
+        })
+
+def get_progress(sid: str):
+    """Obtiene el progreso actual de una sesión"""
+    with progress_lock:
+        return progress_store.get(sid, {}).copy()
+
+def cleanup_progress(sid: str):
+    """Limpia el progreso de una sesión"""
+    with progress_lock:
+        progress_store.pop(sid, None)
 
 # ---------- util firmas/sesiones ----------
 def sign_token(id_str: str, scope: str) -> str:
@@ -526,7 +728,7 @@ def run_ffmpeg_trim(src: str, dst: str, start: float, end: float, precise: bool,
         msg = proc.stderr.decode(errors="ignore")[-400:]
         abort(500, f"FFmpeg falló al recortar: {msg}")
 
-def yt_extract_then_download(url: str, outtmpl: str):
+def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
     base_common = {
         "noplaylist": True,
         "socket_timeout": 30,
@@ -538,6 +740,10 @@ def yt_extract_then_download(url: str, outtmpl: str):
         "no_warnings": True,
         "max_filesize": MAX_UPLOAD_SIZE,  # Limit download size
     }
+    
+    if sid:
+        update_progress(sid, 10, "Extrayendo información del vídeo...", "processing")
+    
     info = None; chosen = None; last_err = None
 
     for client, ua in CLIENTS:
@@ -558,6 +764,9 @@ def yt_extract_then_download(url: str, outtmpl: str):
     if info is None:
         raise last_err if last_err else RuntimeError("No se pudo extraer información del vídeo")
 
+    if sid:
+        update_progress(sid, 30, "Descargando audio...", "processing")
+
     duration = float(info.get("duration") or 0.0)
     client, ua = chosen
     opts_dl = dict(base_common)
@@ -568,9 +777,26 @@ def yt_extract_then_download(url: str, outtmpl: str):
         "http_headers": {"User-Agent": ua},
         "extractor_args": {"youtube": {"player_client": [client]}},
     })
+    
+    # Hook de progreso para yt-dlp
+    def progress_hook(d):
+        if sid and d['status'] == 'downloading':
+            try:
+                percent = d.get('downloaded_bytes', 0) / d.get('total_bytes', 1) * 100
+                # Mapear 30-70% del progreso total
+                progress = 30 + (percent * 0.4)
+                update_progress(sid, int(progress), f"Descargando: {int(percent)}%", "processing")
+            except:
+                pass
+    
+    opts_dl['progress_hooks'] = [progress_hook]
+    
     with yt_dlp.YoutubeDL(opts_dl) as ydl:
         result = ydl.extract_info(url, download=True)
         media_path = ydl.prepare_filename(result)
+
+    if sid:
+        update_progress(sid, 70, "Audio descargado", "processing")
 
     return {"title": info.get("title") or "audio", "duration": duration}, media_path
 
@@ -599,71 +825,82 @@ def safe_download_name(base: str) -> str:
     base = re.sub(r'\s+', ' ', base)
     return base or "audio"
 
+# ---------- Helper para respuestas HTML con UTF-8 ----------
+def render_html(template_string, **context):
+    """Renderiza HTML con charset UTF-8 correcto"""
+    html = render_template_string(template_string, **context)
+    response = app.make_response(html)
+    response.headers['Content-Type'] = 'text/html; charset=utf-8'
+    return response
+
 # ---------- rutas ----------
 @app.get("/")
 def index():
     cleanup_expired()
     print("DEPLOY_MARK:", DEPLOY_MARK, flush=True)
     print("yt-dlp:", yt_dlp.version.__version__, flush=True)
-    return render_template_string(HOME_HTML)
+    return render_html(HOME_HTML)
 
 @app.get("/youtube")
 def youtube_get():
-    return render_template_string(YOUTUBE_HTML)
+    return render_html(YOUTUBE_HTML)
 
 @app.get("/upload")
 def upload_get():
-    return render_template_string(UPLOAD_HTML)
+    return render_html(UPLOAD_HTML)
 
 @app.post("/prepare")
 def prepare():
     cleanup_expired()
     url = (request.form.get("url") or "").strip()
     if not YTLINK.match(url):
-        abort(400, "URL no válida. Debe ser de youtube.com o youtu.be")
+        return {"error": "URL no válida. Debe ser de youtube.com o youtu.be"}, 400
     url = re.sub(r'(\?|&)si=[^&]+', '', url)
 
     sid = uuid.uuid4().hex
-    sdir = os.path.join(TMP_BASE, sid)
-    os.makedirs(sdir, exist_ok=True)
-    outtmpl = os.path.join(sdir, "%(title).200B.%(ext)s")
+    
+    # Iniciar procesamiento en background
+    def process_video():
+        sdir = os.path.join(TMP_BASE, sid)
+        try:
+            os.makedirs(sdir, exist_ok=True)
+            outtmpl = os.path.join(sdir, "%(title).200B.%(ext)s")
 
-    try:
-        info, media_path = yt_extract_then_download(url, outtmpl)
-    except HTTPException:
-        shutil.rmtree(sdir, ignore_errors=True); raise
-    except Exception as e:
-        shutil.rmtree(sdir, ignore_errors=True)
-        abort(502, f"yt-dlp: {str(e)[:300]}")
+            update_progress(sid, 5, "Iniciando descarga...", "processing")
+            
+            info, media_path = yt_extract_then_download(url, outtmpl, sid)
+            
+            if not (media_path and os.path.exists(media_path)):
+                set_progress_error(sid, "No se descargó el audio")
+                shutil.rmtree(sdir, ignore_errors=True)
+                return
 
-    if not (media_path and os.path.exists(media_path)):
-        shutil.rmtree(sdir, ignore_errors=True)
-        abort(500, "No se descargó el audio")
+            update_progress(sid, 75, "Convirtiendo a MP3...", "processing")
+            
+            src_mp3 = os.path.join(sdir, "source.mp3")
+            ffmpeg_to_mp3(media_path, src_mp3)
+            
+            try:
+                if os.path.exists(media_path): os.remove(media_path)
+            except Exception:
+                pass
 
-    src_mp3 = os.path.join(sdir, "source.mp3")
-    ffmpeg_to_mp3(media_path, src_mp3)
-    try:
-        if os.path.exists(media_path): os.remove(media_path)
-    except Exception:
-        pass
+            duration = float(info.get("duration") or 0.0)
+            meta = {"title": info.get("title") or "audio", "duration": duration, "created": datetime.utcnow().isoformat() + "Z"}
+            with open(os.path.join(sdir, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
 
-    duration = float(info.get("duration") or 0.0)
-    meta = {"title": info.get("title") or "audio", "duration": duration, "created": datetime.utcnow().isoformat() + "Z"}
-    with open(os.path.join(sdir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
-
-    return render_template_string(
-        EDITOR_HTML,
-        title=meta["title"],
-        duration_str=hhmmss_from_seconds(duration),
-        audio_url=url_for("audio_stream", sid=sid, sig=sign_token(sid, "audio")),
-        sid=sid,
-        sig=sign_token(sid, "trim"),
-        sig_cancel=sign_token(sid, "cancel"),
-        trim_url=url_for("trim"),
-        cancel_url=url_for("cancel"),
-        home_url=url_for("index"),
-    )
+            set_progress_complete(sid, "Audio preparado correctamente")
+            
+        except Exception as e:
+            set_progress_error(sid, str(e)[:300])
+            shutil.rmtree(sdir, ignore_errors=True)
+    
+    # Iniciar thread
+    thread = threading.Thread(target=process_video, daemon=True)
+    thread.start()
+    
+    return {"session_id": sid}, 200
 
 @app.post("/upload")
 def upload_post():
@@ -703,7 +940,84 @@ def upload_post():
     with open(os.path.join(sdir, "meta.json"), "w", encoding="utf-8") as jf:
         json.dump(meta, jf, ensure_ascii=False)
 
-    return render_template_string(
+    return render_html(
+        EDITOR_HTML,
+        title=meta["title"],
+        duration_str=hhmmss_from_seconds(meta["duration"]),
+        audio_url=url_for("audio_stream", sid=sid, sig=sign_token(sid, "audio")),
+        sid=sid,
+        sig=sign_token(sid, "trim"),
+        sig_cancel=sign_token(sid, "cancel"),
+        trim_url=url_for("trim"),
+        cancel_url=url_for("cancel"),
+        home_url=url_for("index"),
+    )
+
+@app.get("/progress/<sid>")
+def progress_stream(sid):
+    """Stream de progreso usando Server-Sent Events"""
+    def generate():
+        last_status = None
+        timeout = 300  # 5 minutos timeout
+        start_time = time.time()
+        
+        while True:
+            if time.time() - start_time > timeout:
+                yield f"event: error_event\ndata: {json.dumps({'error': 'Timeout'})}\n\n"
+                break
+            
+            progress_data = get_progress(sid)
+            
+            if not progress_data:
+                time.sleep(0.5)
+                continue
+            
+            status = progress_data.get("status", "processing")
+            
+            # Enviar actualización
+            if status != last_status or progress_data.get("progress", 0) > 0:
+                yield f"event: progress\ndata: {json.dumps(progress_data)}\n\n"
+                last_status = status
+            
+            # Si completó, enviar evento final con URL del editor
+            if status == "complete":
+                sdir = sess_dir(sid)
+                meta_path = os.path.join(sdir, "meta.json")
+                if os.path.exists(meta_path):
+                    editor_url = url_for("editor", sid=sid, sig=sign_token(sid, "editor"))
+                    yield f"event: complete\ndata: {json.dumps({'editor_url': editor_url})}\n\n"
+                cleanup_progress(sid)
+                break
+            
+            # Si hubo error, enviar evento de error
+            if status == "error":
+                error_msg = progress_data.get("error", "Error desconocido")
+                yield f"event: error_event\ndata: {json.dumps({'error': error_msg})}\n\n"
+                cleanup_progress(sid)
+                break
+            
+            time.sleep(0.5)
+    
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+@app.get("/editor/<sid>")
+def editor(sid):
+    """Muestra el editor de audio"""
+    sig = request.args.get("sig", "")
+    if not verify_token(sid, "editor", sig):
+        abort(403, "Token inválido")
+    
+    sdir = sess_dir(sid)
+    meta_path = os.path.join(sdir, "meta.json")
+    src = os.path.join(sdir, "source.mp3")
+    
+    if not (os.path.isdir(sdir) and os.path.exists(src) and os.path.exists(meta_path)):
+        abort(410, "Sesión no encontrada o expirada")
+    
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    
+    return render_html(
         EDITOR_HTML,
         title=meta["title"],
         duration_str=hhmmss_from_seconds(meta["duration"]),
