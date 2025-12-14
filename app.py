@@ -672,11 +672,13 @@ def cleanup_expired():
 # ---------- validación y helpers ----------
 YTLINK = re.compile(r'^https?://([a-z0-9-]+\.)*(youtube\.com|youtu\.be)/', re.I)
 
-UA_ANDROID = "com.google.android.youtube/19.20.34 (Linux; Android 14)"
+UA_ANDROID = "com.google.android.youtube/19.29.37 (Linux; U; Android 14; en_US)"
 CLIENTS = [
     ("android", UA_ANDROID),
-    ("mweb", "Mozilla/5.0 (Linux; Android 14; Mobile)"),
-    ("web_music", "Mozilla/5.0"),
+    ("android_music", "com.google.android.apps.youtube.music/7.02.52 (Linux; U; Android 14; en_US)"),
+    ("ios", "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"),
+    ("mweb", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"),
+    ("web", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 ]
 
 def hhmmss_from_seconds(s: float) -> str:
@@ -732,14 +734,27 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
     base_common = {
         "noplaylist": True,
         "socket_timeout": 30,
-        "retries": 3,
+        "retries": 5,
         "concurrent_fragment_downloads": 1,
         "geo_bypass": True,
         "ffmpeg_location": FFMPEG_DIR,
         "quiet": True,
         "no_warnings": True,
-        "max_filesize": MAX_UPLOAD_SIZE,  # Limit download size
+        "max_filesize": MAX_UPLOAD_SIZE,
+        # Anti-bot improvements
+        "extractor_retries": 3,
+        "fragment_retries": 5,
+        "skip_unavailable_fragments": True,
+        "nocheckcertificate": True,
     }
+    
+    # Usar cookies si están disponibles en variable de entorno
+    cookies_txt = os.environ.get("YOUTUBE_COOKIES")
+    if cookies_txt:
+        cookies_file = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        with open(cookies_file, "w") as f:
+            f.write(cookies_txt)
+        base_common["cookiefile"] = cookies_file
     
     if sid:
         update_progress(sid, 10, "Extrayendo información del vídeo...", "processing")
@@ -750,8 +765,13 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
         opts_info = dict(base_common)
         opts_info.update({
             "user_agent": ua,
-            "http_headers": {"User-Agent": ua},
-            "extractor_args": {"youtube": {"player_client": [client]}},
+            "http_headers": {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-us,en;q=0.5",
+                "Sec-Fetch-Mode": "navigate",
+            },
+            "extractor_args": {"youtube": {"player_client": [client], "skip": ["hls", "dash"]}},
         })
         try:
           with yt_dlp.YoutubeDL(opts_info) as ydl:
@@ -774,8 +794,13 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "user_agent": ua,
-        "http_headers": {"User-Agent": ua},
-        "extractor_args": {"youtube": {"player_client": [client]}},
+        "http_headers": {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-us,en;q=0.5",
+            "Sec-Fetch-Mode": "navigate",
+        },
+        "extractor_args": {"youtube": {"player_client": [client], "skip": ["hls", "dash"]}},
     })
     
     # Hook de progreso para yt-dlp
