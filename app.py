@@ -674,9 +674,11 @@ YTLINK = re.compile(r'^https?://([a-z0-9-]+\.)*(youtube\.com|youtu\.be)/', re.I)
 
 UA_ANDROID = "com.google.android.youtube/19.29.37 (Linux; U; Android 14; en_US)"
 CLIENTS = [
+    # Android primero - funciona sin PO Token en 2026
     ("android", UA_ANDROID),
-    ("android_music", "com.google.android.apps.youtube.music/7.02.52 (Linux; U; Android 14; en_US)"),
+    # Fallbacks si android falla
     ("ios", "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"),
+    ("android_music", "com.google.android.apps.youtube.music/7.02.52 (Linux; U; Android 14; en_US)"),
     ("mweb", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"),
     ("web", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 ]
@@ -731,6 +733,10 @@ def run_ffmpeg_trim(src: str, dst: str, start: float, end: float, precise: bool,
         abort(500, f"FFmpeg falló al recortar: {msg}")
 
 def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
+    """
+    Descarga audio de YouTube usando yt-dlp con estrategia multi-cliente.
+    Actualizado 2026: usa cliente android que no requiere PO Token.
+    """
     base_common = {
         "noplaylist": True,
         "socket_timeout": 30,
@@ -748,13 +754,19 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
         "nocheckcertificate": True,
     }
     
-    # Usar cookies si están disponibles en variable de entorno
+    # Logging temporal para diagnóstico (solo en desarrollo)
+    if not os.environ.get("RAILWAY_ENVIRONMENT"):
+        print(f"[DEBUG] yt-dlp version: {yt_dlp.version.__version__}", flush=True)
+    
+    # Usar cookies si están disponibles en variable de entorno (opcional)
     cookies_txt = os.environ.get("YOUTUBE_COOKIES")
     if cookies_txt:
         cookies_file = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
         with open(cookies_file, "w") as f:
             f.write(cookies_txt)
         base_common["cookiefile"] = cookies_file
+        if not os.environ.get("RAILWAY_ENVIRONMENT"):
+            print("[DEBUG] Using YOUTUBE_COOKIES", flush=True)
     
     if sid:
         update_progress(sid, 10, "Extrayendo información del vídeo...", "processing")
@@ -762,6 +774,9 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
     info = None; chosen = None; last_err = None
 
     for client, ua in CLIENTS:
+        if not os.environ.get("RAILWAY_ENVIRONMENT"):
+            print(f"[DEBUG] Trying client: {client}", flush=True)
+        
         opts_info = dict(base_common)
         opts_info.update({
             "user_agent": ua,
@@ -771,18 +786,26 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
                 "Accept-Language": "en-us,en;q=0.5",
                 "Sec-Fetch-Mode": "navigate",
             },
-            "extractor_args": {"youtube": {"player_client": [client], "skip": ["hls", "dash"]}},
+            # IMPORTANTE: NO usar skip: ["hls", "dash"] - permite más formatos
+            "extractor_args": {"youtube": {"player_client": [client]}},
         })
         try:
           with yt_dlp.YoutubeDL(opts_info) as ydl:
             info = ydl.extract_info(url, download=False)
           chosen = (client, ua)
+          if not os.environ.get("RAILWAY_ENVIRONMENT"):
+              print(f"[DEBUG] Success with client: {client}", flush=True)
           break
         except yt_dlp.utils.DownloadError as e:
           last_err = e
+          if not os.environ.get("RAILWAY_ENVIRONMENT"):
+              print(f"[DEBUG] Failed with {client}: {str(e)[:100]}", flush=True)
 
     if info is None:
-        raise last_err if last_err else RuntimeError("No se pudo extraer información del vídeo")
+        error_msg = str(last_err) if last_err else "No se pudo extraer información del vídeo"
+        if not os.environ.get("RAILWAY_ENVIRONMENT"):
+            print(f"[DEBUG] All clients failed. Last error: {error_msg}", flush=True)
+        raise last_err if last_err else RuntimeError(error_msg)
 
     if sid:
         update_progress(sid, 30, "Descargando audio...", "processing")
@@ -800,7 +823,8 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
             "Accept-Language": "en-us,en;q=0.5",
             "Sec-Fetch-Mode": "navigate",
         },
-        "extractor_args": {"youtube": {"player_client": [client], "skip": ["hls", "dash"]}},
+        # IMPORTANTE: NO usar skip: ["hls", "dash"]
+        "extractor_args": {"youtube": {"player_client": [client]}},
     })
     
     # Hook de progreso para yt-dlp
