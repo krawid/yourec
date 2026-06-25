@@ -69,7 +69,7 @@ YOUTUBE_HTML = r'''<!doctype html>
   body { font-family: system-ui, Arial, sans-serif; max-width: 680px; margin: 2rem auto; padding: 1rem; line-height: 1.5; }
   .group { margin-bottom: 1rem; }
   label { display: block; font-weight: 600; margin-bottom: .25rem; }
-  input[type=url] { width: 100%; padding: 100%; padding: .65rem; font-size: 1rem; }
+  input[type=url] { width: 100%; padding: .65rem; font-size: 1rem; }
   button { padding: .65rem 1rem; font-size: 1rem; cursor: pointer; }
   button:disabled { opacity: 0.6; cursor: not-allowed; }
   .hint { font-size: .95rem; }
@@ -256,7 +256,7 @@ EDITOR_HTML = r'''<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>Editar recorte â€“ {{ title }}</title>
+<title>Editar recorte – {{ title }}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { color-scheme: light dark; }
@@ -288,10 +288,10 @@ EDITOR_HTML = r'''<!doctype html>
   <section class="block" aria-labelledby="navh">
     <h2 id="navh" class="sr-only">Navegación temporal</h2>
     <div class="row">
-      <button type="button" data-step="-30">âˆ’30 s</button>
-      <button type="button" data-step="-5">âˆ’5 s</button>
-      <button type="button" data-step="-1">âˆ’1 s</button>
-      <button type="button" data-step="-0.1">âˆ’0.1 s</button>
+      <button type="button" data-step="-30">−30 s</button>
+      <button type="button" data-step="-5">−5 s</button>
+      <button type="button" data-step="-1">−1 s</button>
+      <button type="button" data-step="-0.1">−0.1 s</button>
       <button type="button" data-step="0.1">+0.1 s</button>
       <button type="button" data-step="1">+1 s</button>
       <button type="button" data-step="5">+5 s</button>
@@ -526,7 +526,7 @@ EDITOR_HTML = r'''<!doctype html>
     player.currentTime = st;
     nextPlayIsPreview = true; // marca que el próximo play es de previsualización
     const p = player.play(); if (p && p.catch) p.catch(()=>{});
-    live.textContent = `Reproduciendo recorte ${startI.value} â†’ ${endI.value}.`;
+    live.textContent = `Reproduciendo recorte ${startI.value} → ${endI.value}.`;
   });
 
   window.addEventListener('load', ()=>{
@@ -536,52 +536,6 @@ EDITOR_HTML = r'''<!doctype html>
 </script>
 </body>
 </html>'''
-
-# ---------- Sistema de progreso ----------
-def update_progress(sid: str, progress: int, message: str, status: str = "processing"):
-    """Actualiza el progreso de una sesión"""
-    with progress_lock:
-        if sid not in progress_store:
-            progress_store[sid] = {}
-        progress_store[sid].update({
-            "progress": progress,
-            "message": message,
-            "status": status,
-            "timestamp": time.time()
-        })
-
-def set_progress_error(sid: str, error: str):
-    """Marca una sesión con error"""
-    with progress_lock:
-        if sid not in progress_store:
-            progress_store[sid] = {}
-        progress_store[sid].update({
-            "status": "error",
-            "error": error,
-            "timestamp": time.time()
-        })
-
-def set_progress_complete(sid: str, message: str = "Completado"):
-    """Marca una sesión como completada"""
-    with progress_lock:
-        if sid not in progress_store:
-            progress_store[sid] = {}
-        progress_store[sid].update({
-            "progress": 100,
-            "message": message,
-            "status": "complete",
-            "timestamp": time.time()
-        })
-
-def get_progress(sid: str):
-    """Obtiene el progreso actual de una sesión"""
-    with progress_lock:
-        return progress_store.get(sid, {}).copy()
-
-def cleanup_progress(sid: str):
-    """Limpia el progreso de una sesión"""
-    with progress_lock:
-        progress_store.pop(sid, None)
 
 # ---------- Sistema de progreso ----------
 def update_progress(sid: str, progress: int, message: str, status: str = "processing"):
