@@ -565,10 +565,12 @@ EDITOR_HTML = r'''<!doctype html>
 
   // Comprobar
   document.getElementById('hearStart').addEventListener('click', () => {
-    playSegment(Math.max(0, startSec - 1), Math.min(durationSec, startSec + 1), false, 'Escuchando el inicio del corte.');
+    // Primeros segundos del recorte: empieza justo en el inicio marcado.
+    playSegment(startSec, Math.min(startSec + 2, endSec), false, 'Escuchando el inicio del corte.');
   });
   document.getElementById('hearEnd').addEventListener('click', () => {
-    playSegment(Math.max(0, endSec - 1), Math.min(durationSec, endSec + 1), false, 'Escuchando el final del corte.');
+    // Últimos segundos del recorte: termina justo en el fin marcado.
+    playSegment(Math.max(endSec - 2, startSec), endSec, false, 'Escuchando el final del corte.');
   });
   document.getElementById('previewClip').addEventListener('click', () => {
     playSegment(startSec, endSec, false, 'Escuchando el recorte.');
