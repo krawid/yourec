@@ -20,7 +20,7 @@ app = Flask(__name__)
 if not os.environ.get("APP_SECRET"):
     if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("FLASK_ENV") == "production":
         raise RuntimeError("APP_SECRET environment variable is required in production")
-    print("âš ï¸  WARNING: Using random APP_SECRET (development only)")
+    print("WARNING: Using random APP_SECRET (development only)")
 
 SECRET = (os.environ.get("APP_SECRET") or secrets.token_hex(16)).encode()
 
@@ -672,15 +672,20 @@ def cleanup_expired():
 # ---------- validación y helpers ----------
 YTLINK = re.compile(r'^https?://([a-z0-9-]+\.)*(youtube\.com|youtu\.be)/', re.I)
 
-UA_ANDROID = "com.google.android.youtube/19.29.37 (Linux; U; Android 14; en_US)"
-CLIENTS = [
-    # Android primero - funciona sin PO Token en 2026
-    ("android", UA_ANDROID),
-    # Fallbacks si android falla
-    ("ios", "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"),
-    ("android_music", "com.google.android.apps.youtube.music/7.02.52 (Linux; U; Android 14; en_US)"),
-    ("mweb", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"),
-    ("web", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+# Runtimes JS que yt-dlp puede usar para resolver challenges (nsig + PO tokens).
+# Se listan ambos: usa el que esté disponible (Deno en Railway, Node en local).
+JS_RUNTIMES = {"deno": {}, "node": {}}
+
+# Estrategias de extracción, en orden de preferencia.
+# La 1ª deja que yt-dlp use sus clientes por defecto (web/tv) junto al solver JS
+# para generar PO tokens: es lo que mejor evade el bloqueo por IP de datacenter.
+# El resto son fallbacks con clientes que a veces funcionan sin PO token.
+EXTRACTION_STRATEGIES = [
+    {"name": "default", "clients": None},   # sin forzar player_client
+    {"name": "android", "clients": ["android"]},
+    {"name": "ios", "clients": ["ios"]},
+    {"name": "tv", "clients": ["tv"]},
+    {"name": "web_safari", "clients": ["web_safari"]},
 ]
 
 def hhmmss_from_seconds(s: float) -> str:
@@ -732,10 +737,24 @@ def run_ffmpeg_trim(src: str, dst: str, start: float, end: float, precise: bool,
         msg = proc.stderr.decode(errors="ignore")[-400:]
         abort(500, f"FFmpeg falló al recortar: {msg}")
 
+def _ytdlp_log(msg: str):
+    """Log de diagnóstico (visible también en los logs de Railway)."""
+    print(f"[yt-dlp] {msg}", flush=True)
+
+def _build_opts(base: dict, clients):
+    """Crea un dict de opciones con la estrategia de cliente indicada."""
+    opts = dict(base)
+    extractor_args = {"youtube": {}}
+    if clients:
+        extractor_args["youtube"]["player_client"] = clients
+    opts["extractor_args"] = extractor_args
+    return opts
+
 def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
     """
-    Descarga audio de YouTube usando yt-dlp con estrategia multi-cliente.
-    Actualizado 2026: usa cliente android que no requiere PO Token.
+    Descarga audio de YouTube usando yt-dlp.
+    2026: usa el solver JS (Deno/Node) con clientes por defecto para generar
+    PO tokens y evitar el bloqueo por IP; con fallback a clientes móviles.
     """
     base_common = {
         "noplaylist": True,
@@ -752,81 +771,54 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
         "fragment_retries": 5,
         "skip_unavailable_fragments": True,
         "nocheckcertificate": True,
+        # Runtime JS para resolver nsig + PO tokens (clave en datacenter)
+        "js_runtimes": JS_RUNTIMES,
     }
-    
-    # Logging temporal para diagnóstico (solo en desarrollo)
-    if not os.environ.get("RAILWAY_ENVIRONMENT"):
-        print(f"[DEBUG] yt-dlp version: {yt_dlp.version.__version__}", flush=True)
-    
-    # Usar cookies si están disponibles en variable de entorno (opcional)
+
+    _ytdlp_log(f"version {yt_dlp.version.__version__}")
+
+    # Usar cookies si están disponibles en variable de entorno (opcional, refuerzo)
     cookies_txt = os.environ.get("YOUTUBE_COOKIES")
     if cookies_txt:
         cookies_file = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-        with open(cookies_file, "w") as f:
+        with open(cookies_file, "w", encoding="utf-8") as f:
             f.write(cookies_txt)
         base_common["cookiefile"] = cookies_file
-        if not os.environ.get("RAILWAY_ENVIRONMENT"):
-            print("[DEBUG] Using YOUTUBE_COOKIES", flush=True)
-    
+        _ytdlp_log("using YOUTUBE_COOKIES")
+
     if sid:
         update_progress(sid, 10, "Extrayendo información del vídeo...", "processing")
-    
+
     info = None; chosen = None; last_err = None
 
-    for client, ua in CLIENTS:
-        if not os.environ.get("RAILWAY_ENVIRONMENT"):
-            print(f"[DEBUG] Trying client: {client}", flush=True)
-        
-        opts_info = dict(base_common)
-        opts_info.update({
-            "user_agent": ua,
-            "http_headers": {
-                "User-Agent": ua,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-us,en;q=0.5",
-                "Sec-Fetch-Mode": "navigate",
-            },
-            # IMPORTANTE: NO usar skip: ["hls", "dash"] - permite más formatos
-            "extractor_args": {"youtube": {"player_client": [client]}},
-        })
+    for strat in EXTRACTION_STRATEGIES:
+        _ytdlp_log(f"trying strategy: {strat['name']}")
+        opts_info = _build_opts(base_common, strat["clients"])
         try:
-          with yt_dlp.YoutubeDL(opts_info) as ydl:
-            info = ydl.extract_info(url, download=False)
-          chosen = (client, ua)
-          if not os.environ.get("RAILWAY_ENVIRONMENT"):
-              print(f"[DEBUG] Success with client: {client}", flush=True)
-          break
+            with yt_dlp.YoutubeDL(opts_info) as ydl:
+                info = ydl.extract_info(url, download=False)
+            chosen = strat
+            _ytdlp_log(f"success with strategy: {strat['name']}")
+            break
         except yt_dlp.utils.DownloadError as e:
-          last_err = e
-          if not os.environ.get("RAILWAY_ENVIRONMENT"):
-              print(f"[DEBUG] Failed with {client}: {str(e)[:100]}", flush=True)
+            last_err = e
+            _ytdlp_log(f"failed {strat['name']}: {str(e)[:120]}")
 
     if info is None:
         error_msg = str(last_err) if last_err else "No se pudo extraer información del vídeo"
-        if not os.environ.get("RAILWAY_ENVIRONMENT"):
-            print(f"[DEBUG] All clients failed. Last error: {error_msg}", flush=True)
+        _ytdlp_log(f"all strategies failed. Last error: {error_msg[:200]}")
         raise last_err if last_err else RuntimeError(error_msg)
 
     if sid:
         update_progress(sid, 30, "Descargando audio...", "processing")
 
     duration = float(info.get("duration") or 0.0)
-    client, ua = chosen
-    opts_dl = dict(base_common)
+    opts_dl = _build_opts(base_common, chosen["clients"])
     opts_dl.update({
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
-        "user_agent": ua,
-        "http_headers": {
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-us,en;q=0.5",
-            "Sec-Fetch-Mode": "navigate",
-        },
-        # IMPORTANTE: NO usar skip: ["hls", "dash"]
-        "extractor_args": {"youtube": {"player_client": [client]}},
     })
-    
+
     # Hook de progreso para yt-dlp
     def progress_hook(d):
         if sid and d['status'] == 'downloading':

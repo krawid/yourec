@@ -1,0 +1,6 @@
+# Añade un runtime JavaScript (Deno) al build de Railway.
+# yt-dlp lo necesita para resolver los challenges de YouTube (nsig + PO tokens)
+# y así evitar el bloqueo por IP de datacenter. yt-dlp habilita "deno" por defecto.
+# El token "..." conserva los paquetes que nixpacks detecta para Python.
+[phases.setup]
+nixPkgs = ["...", "deno"]
