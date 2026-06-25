@@ -42,7 +42,7 @@ HOME_HTML = r'''<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>YT a MP3</title>
+<title>Convertir y recortar audio</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { color-scheme: light dark; }
@@ -76,16 +76,16 @@ YOUTUBE_HTML = r'''<!doctype html>
   button { padding: .65rem 1rem; font-size: 1rem; cursor: pointer; }
   button:disabled { opacity: 0.6; cursor: not-allowed; }
   .hint { font-size: .95rem; }
-  .sr-only { position: absolute; left: -10000px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
   .progress-container { display: none; margin-top: 1.5rem; padding: 1rem; background: #f5f5f5; border-radius: 8px; }
   .progress-container.active { display: block; }
   .progress-label { display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-weight: 600; }
-  .progress-percentage { color: #0066cc; font-size: 1.1rem; }
+  .progress-percentage { color: #00509e; font-size: 1.1rem; }
   .progress-bar { width: 100%; height: 24px; background: #e0e0e0; border-radius: 12px; overflow: hidden; box-shadow: inset 0 1px 3px rgba(0,0,0,0.2); }
   .progress-fill { height: 100%; background: linear-gradient(90deg, #0066cc, #0088ff); border-radius: 12px; transition: width 0.3s ease; position: relative; }
   .progress-fill::after { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent); animation: shimmer 2s infinite; }
   @keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
-  .progress-message { margin-top: 0.5rem; font-size: 0.9rem; color: #666; font-style: italic; }
+  .progress-message { margin-top: 0.5rem; font-size: 0.9rem; color: #595959; font-style: italic; }
   .progress-bar.complete .progress-fill { background: linear-gradient(90deg, #4caf50, #66bb6a); }
   .progress-bar.error .progress-fill { background: linear-gradient(90deg, #f44336, #e57373); }
   @media (prefers-color-scheme: dark) {
@@ -113,18 +113,19 @@ YOUTUBE_HTML = r'''<!doctype html>
     </div>
     <button type="submit" id="submitBtn">Preparar audio</button>
   </form>
+  <div role="alert" aria-live="assertive" class="sr-only" id="alertRegion"></div>
   <div id="progressContainer" class="progress-container" role="region" aria-label="Progreso de procesamiento">
     <div aria-live="polite" aria-atomic="true" class="sr-only" id="announcer"></div>
     <div class="progress-label">
       <span id="progressStatus">Preparando</span>
-      <span class="progress-percentage" id="progressPercent" aria-live="polite">0%</span>
+      <span class="progress-percentage" id="progressPercent">0%</span>
     </div>
     <div id="progressBar" class="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100" aria-labelledby="progressStatus">
       <div class="progress-fill" id="progressFill" style="width: 0%">
         <span class="sr-only" id="progressSR">0% completado</span>
       </div>
     </div>
-    <div class="progress-message" id="progressMessage" aria-live="polite"></div>
+    <div class="progress-message" id="progressMessage"></div>
   </div>
 </main>
 <script>
@@ -139,6 +140,7 @@ YOUTUBE_HTML = r'''<!doctype html>
   const progressStatus = document.getElementById('progressStatus');
   const progressSR = document.getElementById('progressSR');
   const announcer = document.getElementById('announcer');
+  const alertRegion = document.getElementById('alertRegion');
   let lastAnnouncedProgress = -1;
   let eventSource = null;
   form.addEventListener('submit', function(e) {
@@ -206,7 +208,7 @@ YOUTUBE_HTML = r'''<!doctype html>
     updateProgress(0, error, 'error');
     submitBtn.disabled = false;
     submitBtn.textContent = 'Preparar audio';
-    announcer.textContent = 'Error: ' + error;
+    alertRegion.textContent = 'Error: ' + error;
     setTimeout(() => {
       progressContainer.classList.remove('active');
       progressBar.classList.remove('error');
@@ -231,7 +233,7 @@ UPLOAD_HTML = r'''<!doctype html>
   input[type=file] { width: 100%; padding: .4rem; font-size: 1rem; }
   button { padding: .65rem 1rem; font-size: 1rem; cursor: pointer; }
   .hint { font-size: .95rem; }
-  .sr-only { position: absolute; left: -10000px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 </style>
 </head>
 <body>
@@ -272,7 +274,7 @@ EDITOR_HTML = r'''<!doctype html>
   .block { margin: 1rem 0; }
   .muted { opacity: .8; }
   .status { margin-top: .5rem; }
-  .sr-only { position: absolute; left: -10000px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 </style>
 </head>
 <body>
@@ -285,20 +287,20 @@ EDITOR_HTML = r'''<!doctype html>
 
 <main role="main">
   <div class="block">
-    <audio id="player" controls preload="metadata" src="{{ audio_url }}">Tu navegador no soporta audio.</audio>
+    <audio id="player" controls preload="metadata" src="{{ audio_url }}" aria-label="Reproductor de audio: {{ title }}">Tu navegador no soporta audio.</audio>
   </div>
 
   <section class="block" aria-labelledby="navh">
     <h2 id="navh" class="sr-only">Navegación temporal</h2>
     <div class="row">
-      <button type="button" data-step="-30">−30 s</button>
-      <button type="button" data-step="-5">−5 s</button>
-      <button type="button" data-step="-1">−1 s</button>
-      <button type="button" data-step="-0.1">−0.1 s</button>
-      <button type="button" data-step="0.1">+0.1 s</button>
-      <button type="button" data-step="1">+1 s</button>
-      <button type="button" data-step="5">+5 s</button>
-      <button type="button" data-step="30">+30 s</button>
+      <button type="button" data-step="-30" aria-label="Retroceder 30 segundos">−30 s</button>
+      <button type="button" data-step="-5" aria-label="Retroceder 5 segundos">−5 s</button>
+      <button type="button" data-step="-1" aria-label="Retroceder 1 segundo">−1 s</button>
+      <button type="button" data-step="-0.1" aria-label="Retroceder una décima de segundo">−0.1 s</button>
+      <button type="button" data-step="0.1" aria-label="Avanzar una décima de segundo">+0.1 s</button>
+      <button type="button" data-step="1" aria-label="Avanzar 1 segundo">+1 s</button>
+      <button type="button" data-step="5" aria-label="Avanzar 5 segundos">+5 s</button>
+      <button type="button" data-step="30" aria-label="Avanzar 30 segundos">+30 s</button>
     </div>
     <div class="hint">Usa los botones para ajustar la posición actual del reproductor.</div>
   </section>
@@ -326,6 +328,8 @@ EDITOR_HTML = r'''<!doctype html>
   </section>
 
   <!-- Formulario de recorte -->
+  <section class="block" aria-labelledby="cuth">
+  <h2 id="cuth" class="sr-only">Recorte y descarga</h2>
   <form class="block" action="{{ trim_url }}" method="post">
     <input type="hidden" name="id" value="{{ sid }}">
     <input type="hidden" name="sig" value="{{ sig }}">
@@ -339,6 +343,7 @@ EDITOR_HTML = r'''<!doctype html>
       <button type="submit">Recortar y descargar</button>
     </div>
   </form>
+  </section>
 
   <!-- Cancelar como POST -->
   <form class="block" action="{{ cancel_url }}" method="post">
@@ -387,6 +392,16 @@ EDITOR_HTML = r'''<!doctype html>
     }
     return NaN;
   }
+  // Sincroniza los campos ocultos del formulario. Barato: se llama en cada tecla.
+  function syncFields() {
+    startH.value = startI.value;
+    endH.value = endI.value;
+    ringtoneH.value = lock30.checked ? "true" : "false";
+    preciseH.value = precise.checked ? "true" : "false";
+    fadesH.value = fades.checked ? "true" : "false";
+  }
+  // Sincroniza y, además, anuncia por voz. Solo en acciones concretas (botones,
+  // confirmación de campo) para no saturar al lector de pantalla en cada tecla.
   function announce() {
     const st = parseTime(startI.value);
     const en = parseTime(endI.value);
@@ -394,11 +409,7 @@ EDITOR_HTML = r'''<!doctype html>
       const dur = en - st;
       live.textContent = `Inicio ${startI.value}. Fin ${endI.value}. Duración del recorte: ${fmt(dur)}.`;
     }
-    startH.value = startI.value;
-    endH.value = endI.value;
-    ringtoneH.value = lock30.checked ? "true" : "false";
-    preciseH.value = precise.checked ? "true" : "false";
-    fadesH.value = fades.checked ? "true" : "false";
+    syncFields();
   }
   function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
 
@@ -489,22 +500,32 @@ EDITOR_HTML = r'''<!doctype html>
       if (isFinite(st) && d != null) endI.value = fmt(Math.min(st + 30.0, d));
     }
     announce();
+    live.textContent = ro
+      ? 'Fin bloqueado a 30 segundos desde el inicio.'
+      : 'Fin desbloqueado. Puedes editarlo.';
     onChangeLimitsLive();
   });
+  // Mientras se escribe: solo sincronizamos campos (sin anunciar en cada tecla).
   startI.addEventListener('input', ()=>{
     if (lock30.checked) {
       const st = parseTime(startI.value);
       const d = isFinite(player.duration) ? player.duration : null;
       if (isFinite(st) && d != null) endI.value = fmt(Math.min(Math.max(st,0) + 30.0, d));
     }
-    announce();
+    syncFields();
     onChangeLimitsLive();
   });
   endI.addEventListener('input', ()=>{
     if (lock30.checked) { lock30.checked = false; endI.readOnly = false; }
-    announce();
+    syncFields();
     onChangeLimitsLive();
   });
+  // Al confirmar el campo (blur/Enter): anuncia el resumen una sola vez.
+  startI.addEventListener('change', announce);
+  endI.addEventListener('change', announce);
+  // Las casillas precise/fades deben reflejarse en los campos ocultos del form.
+  precise.addEventListener('change', syncFields);
+  fades.addEventListener('change', syncFields);
 
   // Parar al llegar a fin de la previsualización. No recolocar al inicio.
   player.addEventListener('timeupdate', ()=>{
