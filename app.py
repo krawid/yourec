@@ -26,6 +26,7 @@ TMP_BASE = os.path.join(tempfile.gettempdir(), "ytmp3_sessions")
 os.makedirs(TMP_BASE, exist_ok=True)
 SESSION_TTL = 30 * 60  # 30 min
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB
+RINGTONE_SECONDS = 29.0  # iOS rechaza tonos de 30 s o más: debe ser < 30
 app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_SIZE
 
 # Sistema de progreso para SSE
@@ -110,6 +111,7 @@ YOUTUBE_HTML = r'''<!doctype html>
     <div class="group">
       <label for="url">Enlace de YouTube</label>
       <input id="url" name="url" type="url" inputmode="url" required>
+      <button type="button" id="pasteBtn">Pegar enlace</button>
     </div>
     <button type="submit" id="submitBtn">Preparar audio</button>
   </form>
@@ -143,6 +145,23 @@ YOUTUBE_HTML = r'''<!doctype html>
   const alertRegion = document.getElementById('alertRegion');
   let lastAnnouncedProgress = -1;
   let eventSource = null;
+  const urlInput = document.getElementById('url');
+  const pasteBtn = document.getElementById('pasteBtn');
+  pasteBtn.addEventListener('click', async function() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        urlInput.value = text.trim();
+        urlInput.focus();
+        alertRegion.textContent = 'Enlace pegado.';
+      } else {
+        alertRegion.textContent = 'El portapapeles está vacío.';
+      }
+    } catch (err) {
+      alertRegion.textContent = 'No se pudo acceder al portapapeles. Pega el enlace manualmente.';
+      urlInput.focus();
+    }
+  });
   form.addEventListener('submit', function(e) {
     e.preventDefault();
     const url = document.getElementById('url').value.trim();
@@ -245,15 +264,28 @@ UPLOAD_HTML = r'''<!doctype html>
 <main role="main" aria-labelledby="h2">
   <h2 id="h2" class="sr-only">Formulario de subida</h2>
 
-  <form action="{{ url_for('upload_post') }}" method="post" enctype="multipart/form-data">
+  <form id="uploadForm" action="{{ url_for('upload_post') }}" method="post" enctype="multipart/form-data">
     <div class="group">
       <label for="file">Archivo de audio o vídeo</label>
       <input id="file" name="file" type="file" accept="audio/*,video/*" required>
       <div class="hint">Se convertirá a MP3 para editar y descargar.</div>
     </div>
-    <button type="submit">Preparar audio</button>
+    <button type="submit" id="uploadBtn">Preparar audio</button>
+    <p id="uploadStatus" class="hint" role="status" aria-live="polite"></p>
   </form>
 </main>
+<script>
+(function(){
+  const form = document.getElementById('uploadForm');
+  const btn = document.getElementById('uploadBtn');
+  const status = document.getElementById('uploadStatus');
+  form.addEventListener('submit', function(){
+    // No bloqueamos el envío nativo; solo damos feedback mientras se procesa.
+    status.textContent = 'Subiendo y procesando el archivo. Esto puede tardar un poco; por favor, espera…';
+    setTimeout(function(){ btn.disabled = true; btn.textContent = 'Procesando…'; }, 0);
+  });
+})();
+</script>
 </body>
 </html>'''
 
@@ -261,302 +293,343 @@ EDITOR_HTML = r'''<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>Editar recorte – {{ title }}</title>
+<title>Editar audio – {{ title }}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root { color-scheme: light dark; }
   body { font-family: system-ui, Arial, sans-serif; max-width: 720px; margin: 2rem auto; padding: 1rem; line-height: 1.5; }
+  h2 { font-size: 1.15rem; margin: .25rem 0 .5rem; }
   .row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: .5rem 0; }
-  button { padding: .55rem .8rem; font-size: 1rem; cursor: pointer; }
-  input[type=text] { padding: .55rem; font-size: 1rem; width: 10ch; }
-  label { font-weight: 600; margin-right: .5rem; }
+  button { padding: .6rem .9rem; font-size: 1rem; min-height: 44px; cursor: pointer; }
+  .primary { font-weight: 700; }
+  input[type=text] { padding: .55rem; font-size: 1rem; width: 9ch; min-height: 44px; }
+  .lbl { font-weight: 600; min-width: 3.5em; display: inline-block; }
   .hint { font-size: .95rem; margin: .25rem 0 .75rem; }
-  .block { margin: 1rem 0; }
-  .muted { opacity: .8; }
+  .timeval { font-size: 1.05rem; margin: .5rem 0; }
+  .block { margin: 1.25rem 0; padding-top: .5rem; border-top: 1px solid rgba(128,128,128,.25); }
+  .muted { opacity: .85; }
   .status { margin-top: .5rem; }
+  details summary { cursor: pointer; font-weight: 600; }
+  audio { width: 100%; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Editar recorte</h1>
+  <h1>Editar audio</h1>
   <div class="muted">{{ title }}</div>
-  <div class="muted">Duración inicial: <span id="totalD">{{ duration_str }}</span></div>
-  <p><a href="{{ home_url }}">Volver</a></p>
+  <div class="muted">Duración total: <span id="totalD">{{ duration_str }}</span></div>
+  <p><a href="{{ home_url }}">Volver al inicio</a></p>
 </header>
 
 <main role="main">
-  <div class="block">
-    <audio id="player" controls preload="metadata" src="{{ audio_url }}" aria-label="Reproductor de audio: {{ title }}">Tu navegador no soporta audio.</audio>
-  </div>
+  <div id="live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <div id="alert" class="sr-only" role="alert" aria-live="assertive"></div>
 
-  <section class="block" aria-labelledby="navh">
-    <h2 id="navh" class="sr-only">Navegación temporal</h2>
-    <div class="row">
-      <button type="button" data-step="-30" aria-label="Retroceder 30 segundos">−30 s</button>
+  <section class="block" aria-labelledby="playh">
+    <h2 id="playh">1. Reproducir y buscar</h2>
+    <audio id="player" controls preload="metadata" src="{{ audio_url }}" aria-label="Reproductor de audio: {{ title }}">Tu navegador no soporta audio.</audio>
+    <p class="timeval">Posición actual: <strong id="curPos">0:00.0</strong></p>
+    <div class="row" role="group" aria-label="Mover la posición del reproductor">
       <button type="button" data-step="-5" aria-label="Retroceder 5 segundos">−5 s</button>
       <button type="button" data-step="-1" aria-label="Retroceder 1 segundo">−1 s</button>
       <button type="button" data-step="-0.1" aria-label="Retroceder una décima de segundo">−0.1 s</button>
       <button type="button" data-step="0.1" aria-label="Avanzar una décima de segundo">+0.1 s</button>
       <button type="button" data-step="1" aria-label="Avanzar 1 segundo">+1 s</button>
       <button type="button" data-step="5" aria-label="Avanzar 5 segundos">+5 s</button>
-      <button type="button" data-step="30" aria-label="Avanzar 30 segundos">+30 s</button>
     </div>
-    <div class="hint">Usa los botones para ajustar la posición actual del reproductor.</div>
   </section>
 
   <section class="block" aria-labelledby="markh">
-    <h2 id="markh" class="sr-only">Marcar inicio y fin</h2>
+    <h2 id="markh">2. Marcar inicio y fin</h2>
+    <p class="hint">Reproduce el audio y, al llegar al punto que quieras, pulsa el botón correspondiente.</p>
     <div class="row">
-      <button type="button" id="markStart">Usar posición como inicio</button>
-      <button type="button" id="markEnd">Usar posición como fin</button>
-      <button type="button" id="clearSel">Usar todo el audio</button>
+      <button type="button" id="markStart" class="primary">Marcar inicio aquí</button>
+      <button type="button" id="markEnd" class="primary">Marcar fin aquí</button>
     </div>
-    <div class="row">
-      <label for="start">Inicio</label>
-      <input id="start" name="start" type="text" inputmode="numeric" placeholder="mm:ss.sss" value="0:00.000" aria-describedby="fmt">
-      <label for="end">Fin</label>
-      <input id="end" name="end" type="text" inputmode="numeric" placeholder="mm:ss.sss" value="{{ duration_str }}" data-init-end="{{ duration_str }}">
-    </div>
-    <div id="fmt" class="hint">Formato: mm:ss.sss o hh:mm:ss.sss</div>
-    <div class="row">
-      <label><input type="checkbox" id="lock30"> Bloquear a 30 s desde el inicio</label>
-      <label><input type="checkbox" id="precise" checked> Corte preciso (recomendado para tonos)</label>
-      <label><input type="checkbox" id="fades" checked> Micro-fundidos 5 ms</label>
-    </div>
-    <div id="live" class="status" aria-live="polite"></div>
+    <p class="timeval">Inicio: <strong id="startTxt">0:00.0</strong> · Fin: <strong id="endTxt">{{ duration_str }}</strong> · Recorte: <strong id="clipDur">—</strong></p>
   </section>
 
-  <!-- Formulario de recorte -->
-  <section class="block" aria-labelledby="cuth">
-  <h2 id="cuth" class="sr-only">Recorte y descarga</h2>
-  <form class="block" action="{{ trim_url }}" method="post">
-    <input type="hidden" name="id" value="{{ sid }}">
-    <input type="hidden" name="sig" value="{{ sig }}">
-    <input type="hidden" id="start_h" name="start">
-    <input type="hidden" id="end_h" name="end">
-    <input type="hidden" id="ringtone_h" name="ringtone_mode" value="false">
-    <input type="hidden" id="precise_h" name="precise" value="true">
-    <input type="hidden" id="fades_h" name="fades" value="true">
-    <div class="row">
-      <button type="button" id="previewClip">Previsualizar recorte</button>
-      <button type="submit">Recortar y descargar</button>
+  <section class="block" aria-labelledby="fineh">
+    <h2 id="fineh">3. Ajuste fino</h2>
+    <div class="row" role="group" aria-label="Ajustar el inicio">
+      <span class="lbl">Inicio</span>
+      <button type="button" data-adj="start" data-d="-1" aria-label="Inicio: retroceder 1 segundo">−1 s</button>
+      <button type="button" data-adj="start" data-d="-0.1" aria-label="Inicio: retroceder una décima">−0.1 s</button>
+      <button type="button" data-adj="start" data-d="0.1" aria-label="Inicio: avanzar una décima">+0.1 s</button>
+      <button type="button" data-adj="start" data-d="1" aria-label="Inicio: avanzar 1 segundo">+1 s</button>
     </div>
-  </form>
+    <div class="row" role="group" aria-label="Ajustar el fin">
+      <span class="lbl">Fin</span>
+      <button type="button" data-adj="end" data-d="-1" aria-label="Fin: retroceder 1 segundo">−1 s</button>
+      <button type="button" data-adj="end" data-d="-0.1" aria-label="Fin: retroceder una décima">−0.1 s</button>
+      <button type="button" data-adj="end" data-d="0.1" aria-label="Fin: avanzar una décima">+0.1 s</button>
+      <button type="button" data-adj="end" data-d="1" aria-label="Fin: avanzar 1 segundo">+1 s</button>
+    </div>
   </section>
 
-  <!-- Cancelar como POST -->
-  <form class="block" action="{{ cancel_url }}" method="post">
+  <section class="block" aria-labelledby="checkh">
+    <h2 id="checkh">4. Comprobar el recorte</h2>
+    <div class="row">
+      <button type="button" id="hearStart">Escuchar el inicio del corte</button>
+      <button type="button" id="hearEnd">Escuchar el final del corte</button>
+    </div>
+    <div class="row">
+      <button type="button" id="previewClip">Escuchar el recorte entero</button>
+      <button type="button" id="loopClip">Escuchar en bucle</button>
+      <button type="button" id="stopPlay">Parar</button>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="opth">
+    <h2 id="opth">Opciones</h2>
+    <div class="row"><label><input type="checkbox" id="precise" checked> Corte preciso (recomendado para tonos)</label></div>
+    <div class="row"><label><input type="checkbox" id="fades" checked> Micro-fundidos de 5 ms (evita clics)</label></div>
+    <details>
+      <summary>Avanzado: escribir los tiempos a mano</summary>
+      <div class="row">
+        <label for="startManual">Inicio</label>
+        <input id="startManual" type="text" inputmode="numeric" placeholder="m:ss.s">
+        <label for="endManual">Fin</label>
+        <input id="endManual" type="text" inputmode="numeric" placeholder="m:ss.s">
+        <button type="button" id="applyManual">Aplicar</button>
+      </div>
+      <p class="hint">Formato: m:ss.s, mm:ss.sss o segundos (por ejemplo 83.5).</p>
+    </details>
+  </section>
+
+  <section class="block" aria-labelledby="dlh">
+    <h2 id="dlh">5. Descargar</h2>
+    <div class="row">
+      <button type="button" id="ringtonePreset" class="primary">Crear tono de llamada ({{ ringtone_seconds }} s)</button>
+    </div>
+    <p id="ringtoneState" class="hint" aria-live="polite"></p>
+    <form id="trimForm" action="{{ trim_url }}" method="post">
+      <input type="hidden" name="id" value="{{ sid }}">
+      <input type="hidden" name="sig" value="{{ sig }}">
+      <input type="hidden" id="start_h" name="start">
+      <input type="hidden" id="end_h" name="end">
+      <input type="hidden" id="ringtone_h" name="ringtone_mode" value="false">
+      <input type="hidden" id="precise_h" name="precise" value="true">
+      <input type="hidden" id="fades_h" name="fades" value="true">
+      <div class="row"><button type="submit" class="primary">Descargar recorte</button></div>
+    </form>
+    <form action="{{ download_full_url }}" method="post">
+      <input type="hidden" name="id" value="{{ sid }}">
+      <input type="hidden" name="sig" value="{{ sig_full }}">
+      <div class="row"><button type="submit">Descargar audio completo</button></div>
+    </form>
+  </section>
+
+  <form action="{{ cancel_url }}" method="post" class="block">
     <input type="hidden" name="id" value="{{ sid }}">
     <input type="hidden" name="sig" value="{{ sig_cancel }}">
-    <button type="submit">Cancelar</button>
+    <button type="submit">Descartar y empezar de nuevo</button>
   </form>
 </main>
 
 <script>
+(function(){
+  const DUR_INIT = {{ duration_sec }};
+  const RING = {{ ringtone_seconds }};
   const player = document.getElementById('player');
   const live = document.getElementById('live');
-  const startI = document.getElementById('start');
-  const endI = document.getElementById('end');
-  const startH = document.getElementById('start_h');
-  const endH = document.getElementById('end_h');
-  const lock30 = document.getElementById('lock30');
+  const alertR = document.getElementById('alert');
+  const curPos = document.getElementById('curPos');
+  const totalD = document.getElementById('totalD');
+  const startTxt = document.getElementById('startTxt');
+  const endTxt = document.getElementById('endTxt');
+  const clipDur = document.getElementById('clipDur');
   const precise = document.getElementById('precise');
   const fades = document.getElementById('fades');
+  const startH = document.getElementById('start_h');
+  const endH = document.getElementById('end_h');
   const ringtoneH = document.getElementById('ringtone_h');
   const preciseH = document.getElementById('precise_h');
   const fadesH = document.getElementById('fades_h');
-  const previewBtn = document.getElementById('previewClip');
-  const clearBtn = document.getElementById('clearSel');
+  const ringtoneState = document.getElementById('ringtoneState');
+  const trimForm = document.getElementById('trimForm');
 
-  function fmt(t) {
-    if (!isFinite(t) || t < 0) t = 0;
-    const h = Math.floor(t / 3600);
-    const m = Math.floor((t % 3600) / 60);
-    const s = (t % 60);
-    const sStr = s.toFixed(3).padStart(6,'0');
-    if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${sStr.padStart(6,'0')}`;
-    return `${m}:${sStr.padStart(6,'0')}`;
+  let durationSec = (Number.isFinite(DUR_INIT) && DUR_INIT > 0) ? DUR_INIT : 0;
+  let startSec = 0;
+  let endSec = durationSec;
+  let ringtone = false;
+  let playMode = null; // {from, end, loop}
+
+  function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+  function fmt(t){
+    t = Math.max(0, t);
+    const m = Math.floor(t/60);
+    const s = t - m*60;
+    return m + ':' + s.toFixed(1).padStart(4,'0');
   }
-  function parseTime(str) {
+  function spoken(t){
+    let dt = Math.round(Math.max(0,t)*10);
+    const m = Math.floor(dt/600); dt -= m*600;
+    const s = Math.floor(dt/10); const tenths = dt%10;
+    const parts = [];
+    if (m>0) parts.push(m + (m===1?' minuto':' minutos'));
+    if (s>0 || (m===0 && tenths===0)) parts.push(s + (s===1?' segundo':' segundos'));
+    if (tenths>0) parts.push(tenths + (tenths===1?' décima':' décimas'));
+    return parts.join(' ');
+  }
+  function say(msg){ live.textContent = ''; live.textContent = msg; }
+  function alertSay(msg){ alertR.textContent = ''; alertR.textContent = msg; }
+
+  function parseTime(str){
     if (!str) return NaN;
-    const parts = str.split(':');
-    if (parts.length === 1) return parseFloat(parts[0]) || NaN;
-    if (parts.length === 2) {
-      const m = parseInt(parts[0],10); const s = parseFloat(parts[1]);
-      if (isNaN(m) || isNaN(s)) return NaN; return m*60 + s;
-    }
-    if (parts.length === 3) {
-      const h = parseInt(parts[0],10), m = parseInt(parts[1],10), s = parseFloat(parts[2]);
-      if ([h,m,s].some(isNaN)) return NaN; return h*3600 + m*60 + s;
-    }
+    const parts = String(str).trim().split(':');
+    if (parts.length === 1) { const v = parseFloat(parts[0]); return isNaN(v)?NaN:v; }
+    if (parts.length === 2) { const m=parseInt(parts[0],10), s=parseFloat(parts[1]); return (isNaN(m)||isNaN(s))?NaN:m*60+s; }
+    if (parts.length === 3) { const h=parseInt(parts[0],10), m=parseInt(parts[1],10), s=parseFloat(parts[2]); return ([h,m,s].some(isNaN))?NaN:h*3600+m*60+s; }
     return NaN;
   }
-  // Sincroniza los campos ocultos del formulario. Barato: se llama en cada tecla.
-  function syncFields() {
-    startH.value = startI.value;
-    endH.value = endI.value;
-    ringtoneH.value = lock30.checked ? "true" : "false";
-    preciseH.value = precise.checked ? "true" : "false";
-    fadesH.value = fades.checked ? "true" : "false";
+
+  function syncHidden(){
+    startH.value = startSec.toFixed(3);
+    endH.value = endSec.toFixed(3);
+    ringtoneH.value = ringtone ? 'true' : 'false';
+    preciseH.value = precise.checked ? 'true' : 'false';
+    fadesH.value = fades.checked ? 'true' : 'false';
   }
-  // Sincroniza y, además, anuncia por voz. Solo en acciones concretas (botones,
-  // confirmación de campo) para no saturar al lector de pantalla en cada tecla.
-  function announce() {
-    const st = parseTime(startI.value);
-    const en = parseTime(endI.value);
-    if (isFinite(st) && isFinite(en) && en > st) {
-      const dur = en - st;
-      live.textContent = `Inicio ${startI.value}. Fin ${endI.value}. Duración del recorte: ${fmt(dur)}.`;
-    }
-    syncFields();
+  function renderTimes(){
+    startTxt.textContent = fmt(startSec);
+    endTxt.textContent = fmt(endSec);
+    clipDur.textContent = (endSec > startSec) ? fmt(endSec - startSec) : '—';
+    syncHidden();
   }
-  function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
-
-  // Ajustar Fin a la duración real si nadie lo cambió aún
-  player.addEventListener('loadedmetadata', ()=>{
-    const d = player.duration;
-    if (Number.isFinite(d) && endI.value === endI.dataset.initEnd) {
-      endI.value = fmt(d);
-      document.getElementById('totalD').textContent = fmt(d);
-      announce();
-    }
-  });
-
-  // Estado de previsualización
-  let previewing = false;
-  let nextPlayIsPreview = false;
-
-  // Al reproducir con el control nativo: por defecto NO es previsualización
-  player.addEventListener('play', ()=>{
-    previewing = nextPlayIsPreview;
-    nextPlayIsPreview = false;
-  });
-
-  // Al pausar de cualquier forma: salir de previsualización
-  player.addEventListener('pause', ()=>{
-    previewing = false;
-  });
-
-  function onChangeLimitsLive(){
-    if (!previewing) return;
-    const st = parseTime(startI.value), en = parseTime(endI.value);
-    if (!(isFinite(st) && isFinite(en) && en > st)) {
-      previewing = false; player.pause(); return;
-    }
-    if (player.currentTime < st || player.currentTime > en) {
-      player.currentTime = st;
-      const p = player.play(); if (p && p.catch) p.catch(()=>{});
-    }
+  function updateRingtoneState(){
+    ringtoneState.textContent = ringtone
+      ? ('Modo tono activado: el fin se mantiene a ' + RING + ' segundos desde el inicio.')
+      : '';
   }
 
-  document.querySelectorAll('button[data-step]').forEach(btn=>{
-    btn.addEventListener('click', ()=>{
+  function setStart(sec, announce){
+    startSec = clamp(sec, 0, durationSec);
+    if (ringtone) endSec = Math.min(startSec + RING, durationSec);
+    else if (endSec <= startSec) endSec = Math.min(startSec + 0.1, durationSec);
+    renderTimes();
+    if (announce) say('Inicio en ' + spoken(startSec) + '. Recorte de ' + spoken(Math.max(0,endSec-startSec)) + '.');
+  }
+  function setEnd(sec, announce){
+    if (ringtone) { ringtone = false; updateRingtoneState(); }
+    endSec = clamp(sec, 0, durationSec);
+    if (endSec <= startSec) startSec = Math.max(endSec - 0.1, 0);
+    renderTimes();
+    if (announce) say('Fin en ' + spoken(endSec) + '. Recorte de ' + spoken(Math.max(0,endSec-startSec)) + '.');
+  }
+
+  function seekTo(t, announce){
+    t = clamp(t, 0, durationSec || 0);
+    try { player.currentTime = t; } catch(e){}
+    curPos.textContent = fmt(t);
+    if (announce) say('Posición ' + spoken(t) + '.');
+  }
+
+  // Reproducción de un segmento, robusta en iOS: play() en el gesto y seek después.
+  function playSegment(from, to, loop, label){
+    if (!(to > from)) { alertSay('Marca un inicio y un fin válidos.'); return; }
+    playMode = { from: from, end: to, loop: loop };
+    const doSeek = () => { try { player.currentTime = from; } catch(e){} };
+    const p = player.play();
+    if (p && p.then) p.then(doSeek).catch(doSeek); else doSeek();
+    if (label) say(label);
+  }
+  function stopPlayback(announce){
+    playMode = null;
+    player.pause();
+    if (announce) say('Reproducción detenida.');
+  }
+
+  // Mover el cursor del reproductor
+  document.querySelectorAll('button[data-step]').forEach(btn => {
+    btn.addEventListener('click', () => {
       const step = parseFloat(btn.getAttribute('data-step'));
-      const d = isFinite(player.duration) ? player.duration : 0;
-      player.currentTime = clamp((player.currentTime||0)+step, 0, d || 0);
-      announce();
-      onChangeLimitsLive();
+      seekTo((player.currentTime || 0) + step, true);
     });
   });
 
-  document.getElementById('markStart').addEventListener('click', ()=>{
-    const pos = player.currentTime || 0;
-    startI.value = fmt(pos);
-    if (lock30.checked) {
-      const d = isFinite(player.duration) ? player.duration : null;
-      if (d != null) endI.value = fmt(Math.min(pos + 30.0, d));
-    }
-    announce();
-    onChangeLimitsLive();
-  });
-  document.getElementById('markEnd').addEventListener('click', ()=>{
-    const pos = player.currentTime || 0;
-    endI.value = fmt(pos);
-    announce();
-    onChangeLimitsLive();
+  // Marcar
+  document.getElementById('markStart').addEventListener('click', () => setStart(player.currentTime || 0, true));
+  document.getElementById('markEnd').addEventListener('click', () => setEnd(player.currentTime || 0, true));
+
+  // Ajuste fino de las marcas
+  document.querySelectorAll('button[data-adj]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const d = parseFloat(btn.getAttribute('data-d'));
+      if (btn.getAttribute('data-adj') === 'start') setStart(startSec + d, true);
+      else setEnd(endSec + d, true);
+    });
   });
 
-  clearBtn.addEventListener('click', ()=>{
-    const d = Number.isFinite(player.duration) ? player.duration : null;
-    if (!d) return;
-    previewing = false;          // corta cualquier previsualización
-    player.pause();
-    player.currentTime = 0;
-    lock30.checked = false;
-    endI.readOnly = false;
-    startI.value = "0:00.000";
-    endI.value = fmt(d);
-    announce();
-    live.textContent = 'Selección anulada. Usando todo el audio.';
+  // Comprobar
+  document.getElementById('hearStart').addEventListener('click', () => {
+    playSegment(Math.max(0, startSec - 1), Math.min(durationSec, startSec + 1), false, 'Escuchando el inicio del corte.');
+  });
+  document.getElementById('hearEnd').addEventListener('click', () => {
+    playSegment(Math.max(0, endSec - 1), Math.min(durationSec, endSec + 1), false, 'Escuchando el final del corte.');
+  });
+  document.getElementById('previewClip').addEventListener('click', () => {
+    playSegment(startSec, endSec, false, 'Escuchando el recorte.');
+  });
+  document.getElementById('loopClip').addEventListener('click', () => {
+    playSegment(startSec, endSec, true, 'Escuchando el recorte en bucle. Pulsa Parar para terminar.');
+  });
+  document.getElementById('stopPlay').addEventListener('click', () => stopPlayback(true));
+
+  // Avanzado: tiempos a mano
+  document.getElementById('applyManual').addEventListener('click', () => {
+    const s = parseTime(document.getElementById('startManual').value);
+    const e = parseTime(document.getElementById('endManual').value);
+    if (isFinite(s)) setStart(s, false);
+    if (isFinite(e)) setEnd(e, false);
+    say('Tiempos aplicados. Inicio ' + spoken(startSec) + ', fin ' + spoken(endSec) + '.');
   });
 
-  lock30.addEventListener('change', ()=>{
-    const ro = lock30.checked;
-    endI.readOnly = ro;
-    if (ro) {
-      const st = parseTime(startI.value);
-      const d = isFinite(player.duration) ? player.duration : null;
-      if (isFinite(st) && d != null) endI.value = fmt(Math.min(st + 30.0, d));
-    }
-    announce();
-    live.textContent = ro
-      ? 'Fin bloqueado a 30 segundos desde el inicio.'
-      : 'Fin desbloqueado. Puedes editarlo.';
-    onChangeLimitsLive();
+  // Preset de tono
+  document.getElementById('ringtonePreset').addEventListener('click', () => {
+    ringtone = true;
+    endSec = Math.min(startSec + RING, durationSec);
+    updateRingtoneState();
+    renderTimes();
+    say('Modo tono de llamada activado. Fin fijado a ' + RING + ' segundos desde el inicio, en ' + spoken(endSec) + '. Ajusta el inicio y descarga.');
   });
-  // Mientras se escribe: solo sincronizamos campos (sin anunciar en cada tecla).
-  startI.addEventListener('input', ()=>{
-    if (lock30.checked) {
-      const st = parseTime(startI.value);
-      const d = isFinite(player.duration) ? player.duration : null;
-      if (isFinite(st) && d != null) endI.value = fmt(Math.min(Math.max(st,0) + 30.0, d));
-    }
-    syncFields();
-    onChangeLimitsLive();
-  });
-  endI.addEventListener('input', ()=>{
-    if (lock30.checked) { lock30.checked = false; endI.readOnly = false; }
-    syncFields();
-    onChangeLimitsLive();
-  });
-  // Al confirmar el campo (blur/Enter): anuncia el resumen una sola vez.
-  startI.addEventListener('change', announce);
-  endI.addEventListener('change', announce);
-  // Las casillas precise/fades deben reflejarse en los campos ocultos del form.
-  precise.addEventListener('change', syncFields);
-  fades.addEventListener('change', syncFields);
 
-  // Parar al llegar a fin de la previsualización. No recolocar al inicio.
-  player.addEventListener('timeupdate', ()=>{
-    if (!previewing) return;
-    const st = parseTime(startI.value), en = parseTime(endI.value);
-    if (!(isFinite(st) && isFinite(en) && en > st)) { previewing=false; player.pause(); return; }
-    if (player.currentTime >= en - 0.0005) {
-      previewing = false;
-      player.pause();
-      live.textContent = 'Previsualización finalizada.';
+  precise.addEventListener('change', syncHidden);
+  fades.addEventListener('change', syncHidden);
+
+  // Reproductor: tiempo actual + lógica de fin de segmento/bucle
+  player.addEventListener('timeupdate', () => {
+    curPos.textContent = fmt(player.currentTime || 0);
+    if (playMode && player.currentTime >= playMode.end - 0.02) {
+      if (playMode.loop) { try { player.currentTime = playMode.from; } catch(e){} }
+      else { player.pause(); playMode = null; }
+    }
+  });
+  // Si el usuario pausa a mano, salimos del modo segmento/bucle.
+  player.addEventListener('pause', () => { playMode = null; });
+
+  player.addEventListener('loadedmetadata', () => {
+    const d = player.duration;
+    if (Number.isFinite(d) && d > 0) {
+      durationSec = d;
+      totalD.textContent = fmt(d);
+      if (!(endSec > 0) || endSec === DUR_INIT || endSec > d) endSec = d;
+      renderTimes();
     }
   });
 
-  // Botón de previsualización
-  previewBtn.addEventListener('click', ()=>{
-    const st = parseTime(startI.value);
-    const en = parseTime(endI.value);
-    if (!(isFinite(st) && isFinite(en) && en > st)) {
-      live.textContent = 'Selecciona inicio y fin válidos para previsualizar.';
-      return;
+  trimForm.addEventListener('submit', (e) => {
+    syncHidden();
+    if (!(endSec > startSec)) {
+      e.preventDefault();
+      alertSay('El recorte no es válido: el fin debe ser mayor que el inicio.');
     }
-    player.currentTime = st;
-    nextPlayIsPreview = true; // marca que el próximo play es de previsualización
-    const p = player.play(); if (p && p.catch) p.catch(()=>{});
-    live.textContent = `Reproduciendo recorte ${startI.value} → ${endI.value}.`;
   });
 
-  window.addEventListener('load', ()=>{
-    endI.readOnly = false;
-    announce();
-  });
+  renderTimes();
+})();
 </script>
 </body>
 </html>'''
@@ -861,6 +934,25 @@ def render_html(template_string, **context):
     response.headers['Content-Type'] = 'text/html; charset=utf-8'
     return response
 
+def render_editor(sid: str, meta: dict):
+    """Renderiza el editor con todas las firmas/URLs que necesita la plantilla."""
+    return render_html(
+        EDITOR_HTML,
+        title=meta["title"],
+        duration_str=hhmmss_from_seconds(meta.get("duration") or 0.0),
+        duration_sec=float(meta.get("duration") or 0.0),
+        ringtone_seconds=int(RINGTONE_SECONDS),
+        audio_url=url_for("audio_stream", sid=sid, sig=sign_token(sid, "audio")),
+        sid=sid,
+        sig=sign_token(sid, "trim"),
+        sig_cancel=sign_token(sid, "cancel"),
+        sig_full=sign_token(sid, "full"),
+        trim_url=url_for("trim"),
+        cancel_url=url_for("cancel"),
+        download_full_url=url_for("download_full"),
+        home_url=url_for("index"),
+    )
+
 # ---------- rutas ----------
 @app.get("/")
 def index():
@@ -980,18 +1072,7 @@ def upload_post():
     with open(os.path.join(sdir, "meta.json"), "w", encoding="utf-8") as jf:
         json.dump(meta, jf, ensure_ascii=False)
 
-    return render_html(
-        EDITOR_HTML,
-        title=meta["title"],
-        duration_str=hhmmss_from_seconds(meta["duration"]),
-        audio_url=url_for("audio_stream", sid=sid, sig=sign_token(sid, "audio")),
-        sid=sid,
-        sig=sign_token(sid, "trim"),
-        sig_cancel=sign_token(sid, "cancel"),
-        trim_url=url_for("trim"),
-        cancel_url=url_for("cancel"),
-        home_url=url_for("index"),
-    )
+    return render_editor(sid, meta)
 
 @app.get("/progress/<sid>")
 def progress_stream(sid):
@@ -1060,19 +1141,8 @@ def editor(sid):
     
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
-    
-    return render_html(
-        EDITOR_HTML,
-        title=meta["title"],
-        duration_str=hhmmss_from_seconds(meta["duration"]),
-        audio_url=url_for("audio_stream", sid=sid, sig=sign_token(sid, "audio")),
-        sid=sid,
-        sig=sign_token(sid, "trim"),
-        sig_cancel=sign_token(sid, "cancel"),
-        trim_url=url_for("trim"),
-        cancel_url=url_for("cancel"),
-        home_url=url_for("index"),
-    )
+
+    return render_editor(sid, meta)
 
 @app.get("/audio/<sid>")
 def audio_stream(sid):
@@ -1121,8 +1191,8 @@ def trim():
     if ringtone_mode:
         if not (start == start):
             abort(400, "Inicio inválido")
-        if duration: end = min(start + 30.0, duration)
-        else: end = start + 30.0
+        if duration: end = min(start + RINGTONE_SECONDS, duration)
+        else: end = start + RINGTONE_SECONDS
     else:
         if not (start == start) or not (end == end):
             abort(400, "Tiempos inválidos")
@@ -1136,16 +1206,36 @@ def trim():
     run_ffmpeg_trim(src, dst, start, end, precise or ringtone_mode, fades if (precise or ringtone_mode) else False)
 
     base = safe_download_name(meta.get("title") or "audio")
-    filename = f"{base}-tono30s.mp3" if ringtone_mode else f"{base}-clip.mp3"
+    filename = f"{base}-tono.mp3" if ringtone_mode else f"{base}-clip.mp3"
+    # La sesión NO se borra aquí: permite sacar varios recortes de una misma
+    # descarga. Se limpia por TTL o con "Descartar y empezar de nuevo".
     resp = send_file(dst, as_attachment=True, download_name=filename)
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
 
-    @resp.call_on_close
-    def _cleanup():
-        try: shutil.rmtree(sdir, ignore_errors=True)
-        except Exception: pass
+@app.post("/download_full")
+def download_full():
+    """Descarga el audio completo tal cual (sin recortar ni recodificar)."""
+    cleanup_expired()
+    sid = (request.form.get("id") or "").strip()
+    sig = (request.form.get("sig") or "").strip()
+    if not verify_token(sid, "full", sig):
+        abort(403, "Token inválido")
 
+    sdir = sess_dir(sid)
+    meta_path = os.path.join(sdir, "meta.json")
+    src = os.path.join(sdir, "source.mp3")
+    if not (os.path.isdir(sdir) and os.path.exists(src) and os.path.exists(meta_path)):
+        shutil.rmtree(sdir, ignore_errors=True)
+        abort(410, "Sesión no encontrada o expirada")
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    base = safe_download_name(meta.get("title") or "audio")
+    resp = send_file(src, as_attachment=True, download_name=f"{base}.mp3")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
     return resp
 
 @app.post("/cancel")
