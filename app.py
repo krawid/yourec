@@ -1,12 +1,10 @@
 ﻿# -*- coding: utf-8 -*-
 import os, re, tempfile, shutil, uuid, time, hmac, hashlib, json, secrets, subprocess, threading
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, request, send_file, render_template_string, abort, url_for, redirect, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 import yt_dlp, imageio_ffmpeg
-
-DEPLOY_MARK = "PYTHONANYWHERE v7-preview-unlock"
 
 # ffmpeg (sin ffprobe)
 ffbin = imageio_ffmpeg.get_ffmpeg_exe()
@@ -33,6 +31,11 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_SIZE
 # Sistema de progreso para SSE
 progress_store = {}  # {session_id: {"progress": 0-100, "message": str, "status": str, "error": str}}
 progress_lock = threading.Lock()
+PROGRESS_TTL = 60 * 60  # 1 h: purga entradas de progreso huérfanas
+
+# Límite de descargas de YouTube simultáneas (evita saturar el servidor)
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
+download_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # ---------- HTMLs ----------
 HOME_HTML = r'''<!doctype html>
@@ -155,7 +158,7 @@ YOUTUBE_HTML = r'''<!doctype html>
     .then(data => {
       if (data.error) { showError(data.error); return; }
       const sid = data.session_id;
-      eventSource = new EventSource('{{ url_for("progress_stream", sid="") }}' + sid);
+      eventSource = new EventSource('{{ url_for("progress_stream", sid="") }}' + sid + '?sig=' + encodeURIComponent(data.sig));
       eventSource.addEventListener('progress', function(e) {
         const data = JSON.parse(e.data);
         updateProgress(data.progress, data.message, data.status);
@@ -623,6 +626,13 @@ def cleanup_expired():
     except FileNotFoundError:
         pass
 
+    # Purga entradas de progreso huérfanas (cliente que nunca abrió el SSE)
+    with progress_lock:
+        stale = [s for s, d in progress_store.items()
+                 if now - d.get("timestamp", now) > PROGRESS_TTL]
+        for s in stale:
+            progress_store.pop(s, None)
+
 # ---------- validación y helpers ----------
 YTLINK = re.compile(r'^https?://([a-z0-9-]+\.)*(youtube\.com|youtu\.be)/', re.I)
 
@@ -664,7 +674,8 @@ def ffmpeg_to_mp3(src: str, dst: str):
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst)==0:
         msg = proc.stderr.decode(errors="ignore")[-400:]
-        abort(500, f"FFmpeg falló al convertir a MP3: {msg}")
+        print(f"[ffmpeg] conversión a MP3 falló: {msg}", flush=True)
+        abort(500, "No se pudo convertir el audio a MP3.")
 
 def run_ffmpeg_trim(src: str, dst: str, start: float, end: float, precise: bool, fades: bool):
     if end <= start:
@@ -689,7 +700,8 @@ def run_ffmpeg_trim(src: str, dst: str, start: float, end: float, precise: bool,
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst)==0:
         msg = proc.stderr.decode(errors="ignore")[-400:]
-        abort(500, f"FFmpeg falló al recortar: {msg}")
+        print(f"[ffmpeg] recorte falló: {msg}", flush=True)
+        abort(500, "No se pudo recortar el audio.")
 
 def _ytdlp_log(msg: str):
     """Log de diagnóstico (visible también en los logs de Railway)."""
@@ -781,7 +793,7 @@ def yt_extract_then_download(url: str, outtmpl: str, sid: str = None):
                 # Mapear 30-70% del progreso total
                 progress = 30 + (percent * 0.4)
                 update_progress(sid, int(progress), f"Descargando: {int(percent)}%", "processing")
-            except:
+            except Exception:
                 pass
     
     opts_dl['progress_hooks'] = [progress_hook]
@@ -832,8 +844,6 @@ def render_html(template_string, **context):
 @app.get("/")
 def index():
     cleanup_expired()
-    print("DEPLOY_MARK:", DEPLOY_MARK, flush=True)
-    print("yt-dlp:", yt_dlp.version.__version__, flush=True)
     return render_html(HOME_HTML)
 
 @app.get("/youtube")
@@ -857,45 +867,57 @@ def prepare():
     # Iniciar procesamiento en background
     def process_video():
         sdir = os.path.join(TMP_BASE, sid)
+        acquired = False
         try:
             os.makedirs(sdir, exist_ok=True)
             outtmpl = os.path.join(sdir, "%(title).200B.%(ext)s")
 
+            update_progress(sid, 1, "En cola, esperando turno...", "processing")
+            if not download_semaphore.acquire(timeout=120):
+                set_progress_error(sid, "El servidor está ocupado. Inténtalo de nuevo en unos minutos.")
+                shutil.rmtree(sdir, ignore_errors=True)
+                return
+            acquired = True
+
             update_progress(sid, 5, "Iniciando descarga...", "processing")
-            
+
             info, media_path = yt_extract_then_download(url, outtmpl, sid)
-            
+
             if not (media_path and os.path.exists(media_path)):
                 set_progress_error(sid, "No se descargó el audio")
                 shutil.rmtree(sdir, ignore_errors=True)
                 return
 
             update_progress(sid, 75, "Convirtiendo a MP3...", "processing")
-            
+
             src_mp3 = os.path.join(sdir, "source.mp3")
             ffmpeg_to_mp3(media_path, src_mp3)
-            
+
             try:
                 if os.path.exists(media_path): os.remove(media_path)
             except Exception:
                 pass
 
             duration = float(info.get("duration") or 0.0)
-            meta = {"title": info.get("title") or "audio", "duration": duration, "created": datetime.utcnow().isoformat() + "Z"}
+            meta = {"title": info.get("title") or "audio", "duration": duration, "created": datetime.now(timezone.utc).isoformat()}
             with open(os.path.join(sdir, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False)
 
             set_progress_complete(sid, "Audio preparado correctamente")
-            
+
         except Exception as e:
+            print(f"[prepare] error procesando {sid}: {e}", flush=True)
             set_progress_error(sid, str(e)[:300])
             shutil.rmtree(sdir, ignore_errors=True)
-    
+        finally:
+            if acquired:
+                download_semaphore.release()
+
     # Iniciar thread
     thread = threading.Thread(target=process_video, daemon=True)
     thread.start()
-    
-    return {"session_id": sid}, 200
+
+    return {"session_id": sid, "sig": sign_token(sid, "progress")}, 200
 
 @app.post("/upload")
 def upload_post():
@@ -914,8 +936,9 @@ def upload_post():
     try:
         f.save(original_path)
     except Exception as e:
+        print(f"[upload] no se pudo guardar el archivo: {e}", flush=True)
         shutil.rmtree(sdir, ignore_errors=True)
-        abort(500, f"No se pudo guardar el archivo: {e}")
+        abort(500, "No se pudo guardar el archivo.")
 
     title = derive_title_from_filename(f.filename)
 
@@ -926,12 +949,13 @@ def upload_post():
     except HTTPException:
         shutil.rmtree(sdir, ignore_errors=True); raise
     except Exception as e:
+        print(f"[upload] fallo de ffmpeg: {e}", flush=True)
         shutil.rmtree(sdir, ignore_errors=True)
-        abort(500, f"FFmpeg fallo: {str(e)[:300]}")
+        abort(500, "No se pudo procesar el archivo.")
 
     duration = probe_duration_seconds(src_mp3)
 
-    meta = {"title": title, "duration": float(duration or 0.0), "created": datetime.utcnow().isoformat() + "Z"}
+    meta = {"title": title, "duration": float(duration or 0.0), "created": datetime.now(timezone.utc).isoformat()}
     with open(os.path.join(sdir, "meta.json"), "w", encoding="utf-8") as jf:
         json.dump(meta, jf, ensure_ascii=False)
 
@@ -951,6 +975,10 @@ def upload_post():
 @app.get("/progress/<sid>")
 def progress_stream(sid):
     """Stream de progreso usando Server-Sent Events"""
+    sig = request.args.get("sig", "")
+    if not verify_token(sid, "progress", sig):
+        abort(403, "Token inválido")
+
     def generate():
         last_status = None
         timeout = 300  # 5 minutos timeout
@@ -1117,6 +1145,9 @@ def legacy_download():
         abort(400, "URL no válida. Debe ser de youtube.com o youtu.be")
     url = re.sub(r'(\?|&)si=[^&]+', "", url)
 
+    if not download_semaphore.acquire(timeout=120):
+        abort(503, "El servidor está ocupado. Inténtalo de nuevo en unos minutos.")
+
     tmpdir = tempfile.mkdtemp(prefix="ytmp3_legacy_")
     outtmpl = os.path.join(tmpdir, "%(title).200B.%(ext)s")
     try:
@@ -1124,8 +1155,11 @@ def legacy_download():
     except HTTPException:
         shutil.rmtree(tmpdir, ignore_errors=True); raise
     except Exception as e:
+        print(f"[download] error yt-dlp: {e}", flush=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
-        abort(502, f"yt-dlp: {str(e)[:300]}")
+        abort(502, "No se pudo descargar el audio de YouTube.")
+    finally:
+        download_semaphore.release()
 
     if not (media_path and os.path.exists(media_path)):
         shutil.rmtree(tmpdir, ignore_errors=True)
